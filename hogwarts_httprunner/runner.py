@@ -1,31 +1,116 @@
+import re
+
 import jsonpath
 import requests
 
 from hogwarts_httprunner.loader import load_yaml
+from requests import sessions
+
+from hogwarts_httprunner.validate import is_api, is_testcase
+
+session = sessions.Session()
+session_variables_mapping = {}
+
+variable_regex_compile = re.compile(r".*\$(\w+).*")
 
 def extract_json_field(resp, json_field):
     value = jsonpath.jsonpath(resp.json(), json_field)
+    return value[0]
 
-def runn_yaml(yaml_file):
-    load_yaml = load_yaml(yaml_file)
 
-    request = load_json["request"]
+def replace_var(content, variables_mapping):
+    matched = variable_regex_compile.match(content)
+    if not matched:
+        return content
 
-    method = request.pop("method")
-    url = request.pop("url")
-    resp = requests.request(method, url ,**request)
+    var_name = matched[1]
+    value = variables_mapping[var_name]
+    replaced_content = content.replace("${}".format(var_name), str(value))
+    return replaced_content
 
-    validator_mapping = load_json["validate"]
 
-    for key, value in validator_mapping.items():
+
+def parse_content(content, variables_mapping):
+    if isinstance(content, dict):
+        parsed_content = {}
+        for key, value in content.items():
+            parsed_value = parse_content(value, variables_mapping)
+            parsed_content[key] = parsed_value
+
+        return parsed_content
+
+    elif isinstance(content, list):
+        parsed_content = []
+        for item in content:
+            parsed_item = parse_content(item, variables_mapping)
+            parsed_content.append(parsed_item)
+
+        return parsed_content
+
+    elif isinstance(content, str):
+        return replace_var(content, variables_mapping)
+
+    else:
+        return content
+
+
+
+
+def run_api(api_info):
+    """
+    :param api_info:
+    {
+        "request":{},
+        "validate":{}
+    }
+    :return:
+    """
+
+    request = api_info["request"]
+    global session_variables_mapping
+    parsed_request = parse_content(request, session_variables_mapping)
+
+    method = parsed_request.pop("method")
+    url = parsed_request.pop("url")
+    resp = session.request(method, url, **parsed_request)
+
+    validator_mapping = api_info["validate"]
+
+    for key in validator_mapping:
         if "$" in key:
-            actual_value = expected_json_field(resp, key)
+            # key = "$.code"
+            actual_value = extract_json_field(resp, key)
         else:
-            actual_value = getattr(resp, key)  # resp.key
-        expected_value = validator_mapping[key]
+            actual_value = getattr(resp, key)
 
+        expected_value = validator_mapping[key]
         assert actual_value == expected_value
+
+    extractor_mapping = api_info.get("extract", {})
+    for var_name in extractor_mapping:
+        var_expr = extractor_mapping[var_name]
+        var_value = extract_json_field(resp, var_expr)
+        session_variables_mapping[var_name] = var_value
+
     return True
 
-def run_api_yaml():
-    pass
+
+def run_yaml(yaml_file):
+    load_content = load_yaml(yaml_file)
+
+    result = []
+
+    if is_api(load_content):
+        success = run_api(load_content)
+        result.append(success)
+    elif is_testcase(load_content):
+        for api_info in load_content:
+            success = run_api(api_info)
+            result.append(success)
+    else:
+        raise Exception("YAML format invalid: {}".format(yaml_file))
+
+    print("result", result)
+    return result
+
+
